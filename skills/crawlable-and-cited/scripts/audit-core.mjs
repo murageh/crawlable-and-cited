@@ -5,8 +5,10 @@
  *   const report = await auditSite('https://example.com', { deadlineMs: 20000 });
  *
  * Pass `fetch` (signature (url, init) => Promise<Response>) to route requests through your
- * own client, e.g. an SSRF-guarded one. When `deadlineMs` elapses, no new fetches start,
- * in-flight ones are ignored, `truncated` is true and INCONCLUSIVE findings say so.
+ * own client, e.g. an SSRF-guarded one. If it throws, the error's message is shown in an
+ * INCONCLUSIVE finding ("could not fetch: ..."); errors named 'GuardError' or with
+ * `noRetry: true` are not retried. When `deadlineMs` elapses, no new fetches start,
+ * in-flight ones are aborted through the signal, `truncated` is true and INCONCLUSIVE findings say so.
  */
 
 const DEFAULT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
@@ -45,6 +47,8 @@ class DeadlineError extends Error {}
 const BLOCKED = [0, 403, 429, 502, 503];
 const blockedWhy = (status) =>
   `the site blocked or challenged the audit (${status || 'network error'}); this is not proof crawlers are refused. Rerun later or with a longer delay between requests, then check it in the search engines' own URL inspection tools`;
+// Why a response could not be judged: the thrown error's own message, or the blocked reason.
+const whyNot = (r) => (r.error ? `could not fetch: ${r.error}` : blockedWhy(r.status));
 
 export async function auditSite(originInput, opts = {}) {
   const state = {};
@@ -86,7 +90,8 @@ async function runAudit(originInput, opts, state) {
         return { status: res.status, location: res.headers.get('location'), body, type: res.headers.get('content-type') || '' };
       } catch (e) {
         if (e instanceof DeadlineError) throw e;
-        if (attempt === RETRIES) return { status: 0, error: String(e), body: '' };
+        const noRetry = e?.name === 'GuardError' || e?.noRetry === true;
+        if (noRetry || attempt === RETRIES) return { status: 0, error: e?.message || String(e), body: '' };
         await sleep(1500);
       }
     }
@@ -103,17 +108,19 @@ async function runAudit(originInput, opts, state) {
   try {
     // ---- robots.txt
     const robots = await get(`${origin}/robots.txt`);
-    disallow = robots.status === 200 ? [...robots.body.matchAll(/^\s*Disallow:\s*(\S+)/gim)].map((m) => m[1]) : [];
-    if (BLOCKED.includes(robots.status)) add('INCONCLUSIVE', 'robots.txt', `${origin}/robots.txt: ${blockedWhy(robots.status)}`);
+    // Only a 200 body is robots.txt; a blocked response may be a challenge page.
+    const robotsTxt = robots.status === 200 ? robots.body : '';
+    disallow = [...robotsTxt.matchAll(/^\s*Disallow:\s*(\S+)/gim)].map((m) => m[1]);
+    if (BLOCKED.includes(robots.status)) add('INCONCLUSIVE', 'robots.txt', `${origin}/robots.txt: ${whyNot(robots)}`);
     else if (robots.status !== 200) add('FAIL', 'robots.txt', `${origin}/robots.txt returned ${robots.status}`);
-    if (/^\s*Disallow:\s*\/\s*$/im.test(robots.body)) add('FAIL', 'robots.txt', 'Disallow: / blocks the whole site');
-    const sitemapRefs = [...robots.body.matchAll(/^\s*Sitemap:\s*(\S+)/gim)].map((m) => m[1]);
+    if (/^\s*Disallow:\s*\/\s*$/im.test(robotsTxt)) add('FAIL', 'robots.txt', 'Disallow: / blocks the whole site');
+    const sitemapRefs = [...robotsTxt.matchAll(/^\s*Sitemap:\s*(\S+)/gim)].map((m) => m[1]);
     if (robots.status === 200 && !sitemapRefs.length) add('WARN', 'robots.txt', 'no Sitemap: line');
 
     // ---- sitemap
     const sitemapUrl = sitemapRefs[0] ?? `${origin}/sitemap.xml`;
     const sm = await get(sitemapUrl, 'follow');
-    if (BLOCKED.includes(sm.status)) add('INCONCLUSIVE', 'sitemap', `${sitemapUrl}: ${blockedWhy(sm.status)}`);
+    if (BLOCKED.includes(sm.status)) add('INCONCLUSIVE', 'sitemap', `${sitemapUrl}: ${whyNot(sm)}`);
     else if (sm.status !== 200) add('FAIL', 'sitemap', `${sitemapUrl} returned ${sm.status}`);
     else {
       sitemapLocs = [...sm.body.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => m[1]);
@@ -121,6 +128,8 @@ async function runAudit(originInput, opts, state) {
         const kids = sitemapLocs; sitemapLocs = [];
         for (const k of kids.slice(0, 20)) {
           const r = await get(k, 'follow');
+          if (BLOCKED.includes(r.status)) { add('INCONCLUSIVE', 'sitemap', `${k}: ${whyNot(r)}`); continue; }
+          if (r.status !== 200) { add('FAIL', 'sitemap', `${k} returned ${r.status}`); continue; }
           sitemapLocs.push(...[...r.body.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => m[1]));
         }
       }
@@ -137,7 +146,7 @@ async function runAudit(originInput, opts, state) {
     for (const url of [...new Set(targets)].slice(0, MAX)) {
       const r = await get(url);
       const a = r.status === 200 ? analyse(r.body) : null;
-      rows.push({ url, status: r.status, location: r.location, ...(a ?? {}) });
+      rows.push({ url, status: r.status, location: r.location, ...(r.error ? { error: r.error } : {}), ...(a ?? {}) });
       await sleep(DELAY);
     }
   } catch (e) {
@@ -152,7 +161,7 @@ async function runAudit(originInput, opts, state) {
     const listed = inSitemap.has(norm(r.url));
     if (BLOCKED.includes(r.status)) {
       // The CDN rate-limited or challenged this script; that is not proof crawlers are refused.
-      add('INCONCLUSIVE', 'status', `${p}: ${blockedWhy(r.status)}`);
+      add('INCONCLUSIVE', 'status', `${p}: ${whyNot(r)}`);
       continue;
     }
     if (r.status !== 200) {

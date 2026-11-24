@@ -122,3 +122,66 @@ for (const status of [403, 429, 503]) {
     assert.ok(inc.every((f) => !/--delay/.test(f.detail)), 'no CLI wording');
   });
 }
+
+// A fake site served from a map of url -> [status, body].
+const fakeSite = (map) => async (url) => {
+  const hit = map[String(url)];
+  if (!hit) return new Response('not found', { status: 404 });
+  return new Response(hit[1], { status: hit[0] });
+};
+const HOME = '<!doctype html><html><head><title>Home</title></head><body><h1>Home</h1></body></html>';
+
+for (const status of [403, 429, 503]) {
+  test(`a sitemap-index child answering ${status} is INCONCLUSIVE with the blocked reason, not silently empty`, async () => {
+    const o = 'https://example.test';
+    const fetch = fakeSite({
+      [`${o}/robots.txt`]: [200, `User-agent: *\nAllow: /\nSitemap: ${o}/sitemap.xml\n`],
+      [`${o}/sitemap.xml`]: [200, `<sitemapindex><sitemap><loc>${o}/pages.xml</loc></sitemap></sitemapindex>`],
+      [`${o}/pages.xml`]: [status, 'challenge'],
+      [`${o}/`]: [200, HOME],
+    });
+    const report = await auditSite(o, { fetch, delayMs: 0, retries: 0 });
+    const f = report.findings.find((x) => x.check === 'sitemap' && x.detail.includes(`${o}/pages.xml`));
+    assert.ok(f, JSON.stringify(report.findings));
+    assert.equal(f.level, 'INCONCLUSIVE');
+    assert.match(f.detail, /blocked or challenged/);
+    assert.ok(f.detail.includes(String(status)));
+  });
+}
+
+test('"Disallow: /" in a blocked robots.txt body (a challenge page) is not a FAIL', async () => {
+  const o = 'https://example.test';
+  const fetch = fakeSite({
+    [`${o}/robots.txt`]: [403, 'Access denied\nDisallow: /\n'],
+    [`${o}/sitemap.xml`]: [200, `<urlset><url><loc>${o}/</loc></url></urlset>`],
+    [`${o}/`]: [200, HOME],
+  });
+  const report = await auditSite(o, { fetch, delayMs: 0, retries: 0 });
+  assert.ok(!report.findings.some((f) => /Disallow: \/ blocks the whole site/.test(f.detail)), JSON.stringify(report.findings));
+});
+
+test('a thrown fetch error is INCONCLUSIVE with its own message, not "blocked or challenged"', async () => {
+  const fetch = async () => { throw new Error('body over 2 MB'); };
+  const report = await auditSite('https://example.test', { fetch, delayMs: 0, retries: 0 });
+  const inc = report.findings.filter((f) => f.level === 'INCONCLUSIVE');
+  assert.ok(inc.length > 0);
+  assert.ok(inc.some((f) => f.check === 'robots.txt' && f.detail.includes('could not fetch: body over 2 MB')), JSON.stringify(inc));
+  assert.ok(inc.every((f) => !/network error/.test(f.detail)), JSON.stringify(inc));
+  assert.equal(report.findings.filter((f) => f.level === 'FAIL').length, 0);
+});
+
+for (const [label, make] of [
+  ['name GuardError', () => Object.assign(new Error('that address is private'), { name: 'GuardError' })],
+  ['noRetry: true', () => Object.assign(new Error('too many redirects'), { noRetry: true })],
+]) {
+  test(`a thrown error with ${label} is not retried`, async () => {
+    let calls = 0;
+    const fetch = async () => { calls++; throw make(); };
+    const started = Date.now();
+    const report = await auditSite('https://example.test', { fetch, delayMs: 0, retries: 2, paths: ['/'] });
+    assert.ok(Date.now() - started < 1000, 'no retry sleeps');
+    // robots.txt, sitemap.xml, / : one call each
+    assert.equal(calls, 3);
+    assert.ok(report.findings.some((f) => f.level === 'INCONCLUSIVE' && f.detail.includes(`could not fetch: ${make().message}`)));
+  });
+}

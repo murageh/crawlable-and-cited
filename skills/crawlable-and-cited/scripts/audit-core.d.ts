@@ -7,7 +7,8 @@ export interface AuditOptions {
   userAgent?: string;
   fetch?: (url: string, init?: RequestInit) => Promise<Response>;
   deadlineMs?: number;
-  /** Retries after a 429/502/503 or network error (default 2, with 5s then 10s backoff). Use 0 to fail fast. */
+  /** Retries after a 429/502/503 or a thrown fetch error (default 2, with 5s then 10s backoff). Use 0 to fail fast.
+   * Errors named 'GuardError' or with `noRetry: true` are never retried. */
   retries?: number;
 }
 
@@ -22,6 +23,8 @@ export interface PageRow {
   robots?: string;
   siteName?: string;
   location?: string | null;
+  /** The thrown fetch error's message, when the request failed without a response. */
+  error?: string;
 }
 
 export interface Finding {
