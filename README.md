@@ -1,6 +1,8 @@
-# Crawlable and cited
+# CiteReady
 
-An agent skill that audits a business website before it goes live, so search engines can crawl it and AI assistants can cite it.
+**Crawlable by search engines. Cited by AI.**
+
+CiteReady is an agent skill that audits a business website before it goes live, so search engines can crawl it and AI assistants can cite it. Its skill ID is `crawlable-and-cited`, the name agents match on.
 
 It checks what crawlers actually **receive** (the HTML before JavaScript runs, status codes, canonicals, sitemaps, robots.txt, site-name signals) and what the **data** shows (Search Console and Bing exports, server logs, the system of record). Every finding comes with its evidence, the fix, and the proof that it is fixed.
 
