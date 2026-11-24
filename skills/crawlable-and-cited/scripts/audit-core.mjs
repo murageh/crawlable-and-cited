@@ -2,7 +2,7 @@
  * audit-core.mjs: the checks behind crawl-audit.mjs, importable. Zero dependencies, Node 18+.
  *
  *   import { auditSite } from '@crispice/citeready';
- *   const report = await auditSite('https://example.co.ke', { deadlineMs: 20000 });
+ *   const report = await auditSite('https://example.com', { deadlineMs: 20000 });
  *
  * Pass `fetch` (signature (url, init) => Promise<Response>) to route requests through your
  * own client, e.g. an SSRF-guarded one. When `deadlineMs` elapses, no new fetches start,
@@ -41,11 +41,22 @@ function analyse(html) {
 
 class DeadlineError extends Error {}
 
+// Statuses that mean the site blocked, challenged or failed the audit request: not proof of a defect.
+const BLOCKED = [0, 403, 429, 502, 503];
+const blockedWhy = (status) =>
+  `the site blocked or challenged the audit (${status || 'network error'}); this is not proof crawlers are refused. Rerun later or with a longer delay between requests, then check it in the search engines' own URL inspection tools`;
+
 export async function auditSite(originInput, opts = {}) {
+  const state = {};
+  try { return await runAudit(originInput, opts, state); } finally { clearTimeout(state.timer); }
+}
+
+async function runAudit(originInput, opts, state) {
   const origin = new URL(originInput).origin;
   const MAX = opts.max ?? 80;
   const TITLE_MAX = opts.titleMax ?? 65;
   const DELAY = opts.delayMs ?? 1200;
+  const RETRIES = opts.retries ?? 2;
   const fetchFn = opts.fetch ?? globalThis.fetch;
   const HEADERS = { 'user-agent': opts.userAgent ?? DEFAULT_UA, accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'accept-language': 'en;q=0.9' };
 
@@ -53,10 +64,10 @@ export async function auditSite(originInput, opts = {}) {
   const add = (level, check, detail) => findings.push({ level, check, detail });
 
   // Deadline: every await that can take time is raced against one timer.
-  let timer;
+  const controller = new AbortController();
   let expired = false;
   const deadline = opts.deadlineMs != null
-    ? new Promise((_, rej) => { timer = setTimeout(() => { expired = true; rej(new DeadlineError()); }, opts.deadlineMs); })
+    ? new Promise((_, rej) => { state.timer = setTimeout(() => { expired = true; controller.abort(); rej(new DeadlineError()); }, opts.deadlineMs); })
     : null;
   deadline?.catch(() => {}); // no unhandled rejection when nothing is racing at that moment
   const race = (p) => {
@@ -66,16 +77,16 @@ export async function auditSite(originInput, opts = {}) {
   const sleep = (ms) => race(new Promise((r) => setTimeout(r, ms)));
 
   async function get(url, redirect = 'manual') {
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt <= RETRIES; attempt++) {
       try {
-        const res = await race(fetchFn(url, { headers: HEADERS, redirect }));
+        const res = await race(fetchFn(url, { headers: HEADERS, redirect, signal: controller.signal }));
         const body = await race(res.text());
         // Rate limiting / CDN challenge of THIS script: back off and retry, then report the code.
-        if ([429, 502, 503].includes(res.status) && attempt < 2) { await sleep(5000 * 2 ** attempt); continue; }
+        if ([429, 502, 503].includes(res.status) && attempt < RETRIES) { await sleep(5000 * 2 ** attempt); continue; }
         return { status: res.status, location: res.headers.get('location'), body, type: res.headers.get('content-type') || '' };
       } catch (e) {
         if (e instanceof DeadlineError) throw e;
-        if (attempt === 2) return { status: 0, error: String(e), body: '' };
+        if (attempt === RETRIES) return { status: 0, error: String(e), body: '' };
         await sleep(1500);
       }
     }
@@ -93,7 +104,8 @@ export async function auditSite(originInput, opts = {}) {
     // ---- robots.txt
     const robots = await get(`${origin}/robots.txt`);
     disallow = robots.status === 200 ? [...robots.body.matchAll(/^\s*Disallow:\s*(\S+)/gim)].map((m) => m[1]) : [];
-    if (robots.status !== 200) add('FAIL', 'robots.txt', `${origin}/robots.txt returned ${robots.status}`);
+    if (BLOCKED.includes(robots.status)) add('INCONCLUSIVE', 'robots.txt', `${origin}/robots.txt: ${blockedWhy(robots.status)}`);
+    else if (robots.status !== 200) add('FAIL', 'robots.txt', `${origin}/robots.txt returned ${robots.status}`);
     if (/^\s*Disallow:\s*\/\s*$/im.test(robots.body)) add('FAIL', 'robots.txt', 'Disallow: / blocks the whole site');
     const sitemapRefs = [...robots.body.matchAll(/^\s*Sitemap:\s*(\S+)/gim)].map((m) => m[1]);
     if (robots.status === 200 && !sitemapRefs.length) add('WARN', 'robots.txt', 'no Sitemap: line');
@@ -101,7 +113,8 @@ export async function auditSite(originInput, opts = {}) {
     // ---- sitemap
     const sitemapUrl = sitemapRefs[0] ?? `${origin}/sitemap.xml`;
     const sm = await get(sitemapUrl, 'follow');
-    if (sm.status !== 200) add('FAIL', 'sitemap', `${sitemapUrl} returned ${sm.status}`);
+    if (BLOCKED.includes(sm.status)) add('INCONCLUSIVE', 'sitemap', `${sitemapUrl}: ${blockedWhy(sm.status)}`);
+    else if (sm.status !== 200) add('FAIL', 'sitemap', `${sitemapUrl} returned ${sm.status}`);
     else {
       sitemapLocs = [...sm.body.matchAll(/<loc>\s*([^<\s]+)\s*<\/loc>/g)].map((m) => m[1]);
       if (/<sitemapindex/i.test(sm.body)) {
@@ -137,9 +150,9 @@ export async function auditSite(originInput, opts = {}) {
   for (const r of rows) {
     const p = new URL(r.url).pathname;
     const listed = inSitemap.has(norm(r.url));
-    if ([0, 429, 502, 503].includes(r.status)) {
+    if (BLOCKED.includes(r.status)) {
       // The CDN rate-limited or challenged this script; that is not proof crawlers are refused.
-      add('INCONCLUSIVE', 'status', `${p} → ${r.status || 'network error'} (rerun slower with --delay 3000, then check Bing/Google live URL tests)`);
+      add('INCONCLUSIVE', 'status', `${p}: ${blockedWhy(r.status)}`);
       continue;
     }
     if (r.status !== 200) {
@@ -199,7 +212,6 @@ export async function auditSite(originInput, opts = {}) {
     }
   }
 
-  clearTimeout(timer);
   if (truncated) {
     add('INCONCLUSIVE', 'time limit', `The audit ran out of time (${opts.deadlineMs} ms) and stopped early. Pages it did not reach were not checked, so they are not failures; rerun with a longer limit or audit fewer pages.`);
     if (!rows.length) add('INCONCLUSIVE', 'time limit', 'No page was fetched before the time limit, so there are no page results.');

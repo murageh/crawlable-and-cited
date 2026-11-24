@@ -99,3 +99,26 @@ test('injected fetch is used', async () => {
   await auditSite('https://example.test', { fetch: fake, delayMs: 0 });
   assert.ok(seen.includes('https://example.test/robots.txt'));
 });
+
+test('deadline aborts the signal passed to the injected fetch', async () => {
+  const signals = [];
+  const hang = (url, init) => { signals.push(init?.signal); return new Promise(() => {}); };
+  await auditSite('https://example.test', { fetch: hang, deadlineMs: 150, delayMs: 0 });
+  assert.ok(signals.length > 0 && signals.every((s) => s instanceof AbortSignal));
+  assert.ok(signals.every((s) => s.aborted), 'in-flight request was cancelled');
+});
+
+for (const status of [403, 429, 503]) {
+  test(`a site answering ${status} to the audit is INCONCLUSIVE, never FAIL, and fails fast with retries: 0`, async () => {
+    const blocked = async () => new Response('challenge', { status });
+    const started = Date.now();
+    const report = await auditSite('https://example.test', { fetch: blocked, delayMs: 0, retries: 0 });
+    assert.ok(Date.now() - started < 2000, 'no backoff sleeping');
+    assert.equal(report.findings.filter((f) => f.level === 'FAIL').length, 0, JSON.stringify(report.findings));
+    const inc = report.findings.filter((f) => f.level === 'INCONCLUSIVE');
+    assert.ok(inc.some((f) => f.check === 'robots.txt' && /blocked or challenged/.test(f.detail) && f.detail.includes(String(status))));
+    assert.ok(inc.some((f) => f.check === 'sitemap'));
+    assert.ok(inc.some((f) => f.check === 'status'));
+    assert.ok(inc.every((f) => !/--delay/.test(f.detail)), 'no CLI wording');
+  });
+}
