@@ -43,6 +43,7 @@ It has no dependencies and needs Node 18 or later.
 ```bash
 node skills/crawlable-and-cited/scripts/crawl-audit.mjs https://example.com --hosts shop.example.com,example.vercel.app
 node --test skills/crawlable-and-cited/scripts/crawl-audit.test.mjs   # self-test against a site with planted defects
+# as a library: import { auditSite } from '@crispice/citeready'  (returns { rows, findings, sitemapCount, truncated })
 ```
 
 It exits with code 1 when it finds any FAIL, so it can gate a deploy. On Git Bash for Windows, prefix `MSYS_NO_PATHCONV=1` when passing `--paths /`.

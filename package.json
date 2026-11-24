@@ -1,0 +1,11 @@
+{
+  "name": "@crispice/citeready",
+  "version": "0.1.0",
+  "description": "What a crawler that does not run JavaScript gets from your site: crawlability and AI-citation audit.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "exports": { ".": { "types": "./skills/crawlable-and-cited/scripts/audit-core.d.ts", "default": "./skills/crawlable-and-cited/scripts/audit-core.mjs" } },
+  "bin": { "citeready": "./skills/crawlable-and-cited/scripts/crawl-audit.mjs" },
+  "files": ["skills/crawlable-and-cited/scripts/audit-core.mjs", "skills/crawlable-and-cited/scripts/audit-core.d.ts", "skills/crawlable-and-cited/scripts/crawl-audit.mjs"]
+}
